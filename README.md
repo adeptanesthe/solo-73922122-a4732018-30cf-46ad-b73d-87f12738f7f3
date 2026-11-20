@@ -2,7 +2,9 @@
 
 食堂值班员只有一块总电表，需要核对两台设备各自的开停时段。本服务接收
 **至多一天（1–1440 分钟）的逐分钟总功率**，用显式时长隐半马尔可夫模型
-（HSMM）联合推断两台设备的运行/停机/待核实时段。
+（HSMM）联合推断两台设备的运行/停机/待核实时段；并提供**班次用电核算**
+接口，按所有合法联合开停路径的后验权重计算单台设备用电超过上限的概率，
+用于判断该设备的用电是否值得排查。
 
 ## 模型与判定口径
 
@@ -28,10 +30,10 @@
 
 ```
 app/
-  hsmm.py      # HSMM 状态空间、转移表、前向-后向、区间标注
+  hsmm.py      # HSMM 状态空间、转移表、前向-后向、区间标注、班次用电核算
   schemas.py   # Pydantic 请求/响应模型与输入校验
-  main.py      # FastAPI 路由（/health、/infer、/docs）
-tests/         # 21 项 unittest 自测（模型性质 + 接口校验）
+  main.py      # FastAPI 路由（/health、/infer、/shift/energy-audit、/docs）
+tests/         # 40 项 unittest 自测（模型性质 + 接口校验）
 examples/      # 请求样例与调用脚本
 Dockerfile
 docker-compose.yml
@@ -49,8 +51,51 @@ docker compose up --build
 - 交互式文档：`GET /docs`（Swagger UI）
 - OpenAPI Schema：`GET /openapi.json`
 - 推断接口：`POST /infer`
+- 班次用电核算：`POST /shift/energy-audit`
 
 停止：`docker compose down`
+
+## 班次用电核算（用电超额概率）
+
+`POST /shift/energy-audit` 复用同一 HSMM，对一个班次（**1–120 分钟**）内
+目标设备的总电量做后验核算：把每条合法联合开停路径按后验概率加权，
+汇总目标设备电量**严格大于**上限的概率，用于判断该设备用电是否值得排查。
+
+口径说明：
+
+- 功率单位为**千瓦（kW）**，每分钟电量 = 功率 / 60（千瓦时）；
+- **开机与待机功率都计入电量**；
+- **缺测分钟照常计入**（状态转移不停、电量不丢）；
+- **恰好达到上限不算超额**；
+- 每台设备只需一个 1–30 分钟的最短时长，开机与停机共用。
+
+### 请求字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `power` | 逐分钟总功率数组（kW），长度 1–120；`null` 表示缺测 |
+| `noise_std` | 读数噪声标准差，必须 > 0 |
+| `device1` / `device2` | `name`、`on_power`、`standby_power`、`min_duration_minutes`（1–30，开停共用） |
+| `target_device` | 核算对象：`1` = device1，`2` = device2 |
+| `energy_limit_kwh` | 电量上限（千瓦时），≥ 0 |
+| `switch_probability` | 单设备单分钟翻转先验概率，默认 0.1，∈ (0, 1) |
+
+### 响应摘要
+
+- `exceedance_probability`：用电超过上限的后验概率（核心结论）；
+- `expected_energy_kwh` / `expected_on_minutes`：用电量 / 开机分钟数的后验期望；
+- `min_possible_energy_kwh` / `max_possible_energy_kwh`：窗口内理论电量范围；
+- `window_minutes`、`missing_minutes`、`target_name`、`log_likelihood`。
+
+### 调用样例
+
+```bash
+curl -s http://127.0.0.1:8000/shift/energy-audit \
+  -H 'Content-Type: application/json' \
+  -d @examples/shift_request.json | python -m json.tool
+```
+
+或 `python examples/call_shift_example.py`。
 
 ## 调用样例
 
@@ -97,4 +142,5 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
 全天 1440 分钟、最短时长均为 30 的最坏规模（3600 个增强状态）在普通
-CPU 上约 1 秒完成推断。
+CPU 上约 1 秒完成推断；班次核算（120 分钟、带开机分钟数计数维度）同为
+秒级。

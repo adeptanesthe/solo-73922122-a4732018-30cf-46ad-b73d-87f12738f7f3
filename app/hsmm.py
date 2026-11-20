@@ -307,6 +307,174 @@ def infer_posterior(
     }
 
 
+def _forward_count_log_weights(
+    emit: np.ndarray,
+    model: _Model,
+    on_flag: np.ndarray,
+) -> tuple[np.ndarray, float]:
+    """按目标设备开机分钟数分解的前向 DP。
+
+    在与 _forward_backward 完全相同的转移与发射权重下，把每个时刻的
+    前向权重按“目标设备已开机分钟数 k”细分：
+
+        alpha_t[s, k] = 所有在 t 时刻到达增强状态 s、且目标设备
+                        恰好开机 k 分钟的合法路径的权重之和（对数空间）。
+
+    缺测分钟发射行为全 0（沿用 _log_emission），但状态照常转移、
+    计数照常累加，因此缺测分钟同样计入开机分钟数与电量。
+
+    返回 (log_weight_by_count, log_likelihood)：
+    log_weight_by_count[k] 为所有开机 k 分钟的路径权重和的对数（长度 T+1），
+    log_likelihood 为全部路径权重和的对数，与普通前向结果一致。
+    """
+
+    t_total = emit.shape[0]
+    n_states = model.n_states
+    width = t_total + 1
+    on_state = on_flag.astype(bool)
+
+    prev = np.full((n_states, width), NEG_INF, dtype=np.float64)
+    log_init = -math.log(n_states)  # 初始均匀，允许窗口首尾截断（与主模型一致）
+    base = log_init + emit[0]
+    prev[on_state, 1] = base[on_state]
+    prev[~on_state, 0] = base[~on_state]
+
+    for t in range(1, t_total):
+        w_prev = t + 1  # 前 t 分钟最多开机 t 分钟，计数列只需 0..t
+        cur = np.full((n_states, width), NEG_INF, dtype=np.float64)
+        emit_row = emit[t]
+        for _d, (states, nb_idx, logw) in model.pred_groups.items():
+            # (n_d, deg, w_prev)：各前驱在计数 k 上的权重 + 转移对数权重
+            gathered = prev[nb_idx, :w_prev] + logw[:, :, None]
+            row_max = gathered.max(axis=1)
+            safe_max = np.where(np.isfinite(row_max), row_max, 0.0)
+            with np.errstate(divide="ignore"):
+                summed = np.exp(gathered - safe_max[:, None, :]).sum(axis=1)
+                lse = np.where(
+                    np.isfinite(row_max),
+                    row_max + np.log(summed),
+                    NEG_INF,
+                )
+            # 目标设备本分钟若开机，计数整体右移一格（k=0 列保持 -inf）
+            shifted = np.full((len(states), w_prev + 1), NEG_INF, dtype=np.float64)
+            shifted[:, 1:] = lse
+            stay = np.full((len(states), w_prev + 1), NEG_INF, dtype=np.float64)
+            stay[:, :w_prev] = lse
+            row = np.where(on_state[states][:, None], shifted, stay)
+            cur[states, : w_prev + 1] = row + emit_row[states][:, None]
+        prev = cur
+
+    col_max = prev.max(axis=0)
+    safe_col = np.where(np.isfinite(col_max), col_max, 0.0)
+    with np.errstate(divide="ignore"):
+        col_sum = np.exp(prev - safe_col[None, :]).sum(axis=0)
+        log_weight = np.where(
+            np.isfinite(col_max), col_max + np.log(col_sum), NEG_INF
+        )
+    total_max = log_weight.max()
+    log_likelihood = total_max + math.log(float(np.exp(log_weight - total_max).sum()))
+    if not math.isfinite(log_likelihood):
+        raise RuntimeError("序列似然为零，参数与观测完全不相容，请检查输入")
+    return log_weight, log_likelihood
+
+
+def shift_energy_audit(
+    power: list[float | None],
+    noise_std: float,
+    device1: DeviceParams,
+    device2: DeviceParams,
+    target_device: int,
+    energy_limit_kwh: float,
+    switch_probability: float = 0.1,
+) -> dict:
+    """班次用电核算：目标设备用电超过上限的后验概率。
+
+    沿用 infer_posterior 的同一 HSMM（相同状态空间、转移表与发射模型），
+    对所有合法联合开停路径按后验权重汇总目标设备的逐分钟电量。
+
+    电量口径
+    --------
+    * 功率单位为千瓦 (kW)，每分钟电量 = 功率 / 60（千瓦时）；
+    * 开机与待机（停机）功率都计入电量；
+    * 缺测分钟照常计入（状态转移不停，计数不丢）；
+    * 恰好达到上限不算超额（严格大于才计）。
+
+    由于每分钟只取 on_power / off_power 两档，总电量只取决于开机分钟数 k：
+    energy(k) = (off_power * T + (on_power - off_power) * k) / 60，
+    因此先求 k 的后验分布，再对能量超上限的 k 求和即得超额概率。
+
+    参数
+    ----
+    power: 逐分钟总功率（kW），None 表示缺测，长度 1-120。
+    noise_std: 读数噪声标准差（正值）。
+    device1, device2: 两台设备参数（off_power 即待机功率）。
+    target_device: 1 或 2，指定核算哪台设备。
+    energy_limit_kwh: 电量上限（千瓦时，非负）。
+    switch_probability: 单台设备单分钟翻转先验概率（与主模型一致）。
+
+    返回
+    ----
+    字典：exceedance_probability、expected_energy_kwh、expected_on_minutes、
+    可能电量范围、对数似然等。
+    """
+
+    if not power:
+        raise ValueError("power 序列不能为空")
+    t_total = len(power)
+    if t_total > 120:
+        raise ValueError("班次核算窗口最长为 120 分钟")
+    if target_device not in (1, 2):
+        raise ValueError("target_device 必须为 1 或 2")
+    if not (energy_limit_kwh >= 0.0) or not math.isfinite(energy_limit_kwh):
+        raise ValueError("energy_limit_kwh 必须为非负有限数值")
+
+    raw = np.array(
+        [np.nan if v is None else float(v) for v in power], dtype=np.float64
+    )
+    missing = np.isnan(raw)
+    model = _build_model(device1, device2, switch_probability)
+    emit = _log_emission(raw, missing, model, float(noise_std))
+
+    if target_device == 1:
+        on_flag = model.state_s1 == 1
+        on_power, off_power = device1.on_power, device1.off_power
+    else:
+        on_flag = model.state_s2 == 1
+        on_power, off_power = device2.on_power, device2.off_power
+
+    log_weight, log_likelihood = _forward_count_log_weights(emit, model, on_flag)
+    log_posterior = log_weight - log_likelihood  # 各开机分钟数 k 的后验对数概率
+
+    counts = np.arange(t_total + 1, dtype=np.float64)
+    # 每分钟电量 = 功率(kW) / 60（千瓦时）；开机与待机都计入
+    energy_by_count = (off_power * t_total + (on_power - off_power) * counts) / 60.0
+    # 恰好达到上限不算超额：用相对容差吸收浮点表示误差
+    tol = 1e-9 * max(1.0, abs(energy_limit_kwh))
+    exceed_mask = energy_by_count > energy_limit_kwh + tol
+
+    with np.errstate(under="ignore"):
+        count_posterior = np.exp(log_posterior)
+    exceedance = float(count_posterior[exceed_mask].sum())
+    exceedance = min(max(exceedance, 0.0), 1.0)
+
+    expected_on = float((count_posterior * counts).sum())
+    expected_energy = (off_power * t_total + (on_power - off_power) * expected_on) / 60.0
+
+    return {
+        "window_minutes": t_total,
+        "missing_minutes": int(missing.sum()),
+        "target_device": target_device,
+        "energy_limit_kwh": energy_limit_kwh,
+        "exceedance_probability": exceedance,
+        "expected_energy_kwh": expected_energy,
+        "expected_on_minutes": expected_on,
+        "min_possible_energy_kwh": float(min(energy_by_count[0], energy_by_count[-1])),
+        "max_possible_energy_kwh": float(max(energy_by_count[0], energy_by_count[-1])),
+        "log_likelihood": log_likelihood,
+        "on_minutes_posterior": count_posterior.tolist(),
+    }
+
+
 def label_intervals(
     posterior_on: list[float],
     missing: list[bool],

@@ -10,10 +10,69 @@ import unittest
 
 import numpy as np
 
-from app.hsmm import DeviceParams, infer_posterior, label_intervals, _build_model
+from app.hsmm import (
+    DeviceParams,
+    _build_model,
+    _log_emission,
+    infer_posterior,
+    label_intervals,
+    shift_energy_audit,
+)
 
 D1 = DeviceParams(on_power=10.0, off_power=0.0, min_on=5, min_off=5)
 D2 = DeviceParams(on_power=20.0, off_power=0.0, min_on=3, min_off=3)
+
+NEG_INF = -math.inf
+
+
+def make_series_for(d1, d2, s1, s2, noise_std, seed=0):
+    rng = np.random.default_rng(seed)
+    t_total = len(s1)
+    y = np.empty(t_total)
+    for t in range(t_total):
+        mu = (d1.on_power if s1[t] else d1.off_power) + (
+            d2.on_power if s2[t] else d2.off_power
+        )
+        y[t] = mu + rng.normal(0.0, noise_std)
+    return y.tolist()
+
+
+def brute_force_count_posterior(power, noise_std, d1, d2, target_index, p_switch=0.1):
+    """枚举全部增强状态路径，精确求目标设备开机分钟数的后验分布（对照用）。"""
+    model = _build_model(d1, d2, p_switch)
+    raw = np.array([np.nan if v is None else float(v) for v in power])
+    emit = _log_emission(raw, np.isnan(raw), model, noise_std)
+    on = (model.state_s1 if target_index == 0 else model.state_s2) == 1
+    t_total = len(power)
+
+    succ = [[] for _ in range(model.n_states)]
+    for _d, (states, idx, logw) in model.succ_groups.items():
+        for row, s in enumerate(states):
+            succ[int(s)] = list(zip(idx[row].tolist(), logw[row].tolist()))
+
+    log_init = -math.log(model.n_states)
+    dp = []
+    for s in range(model.n_states):
+        w = np.full(t_total + 1, NEG_INF)
+        w[1 if on[s] else 0] = log_init + emit[0, s]
+        dp.append(w)
+    for t in range(1, t_total):
+        ndp = [np.full(t_total + 1, NEG_INF) for _ in range(model.n_states)]
+        for s in range(model.n_states):
+            for j, lw in succ[s]:
+                shifted = np.full(t_total + 1, NEG_INF)
+                src = dp[s] + lw + emit[t, j]
+                if on[j]:
+                    shifted[1:] = src[:-1]
+                else:
+                    shifted[:] = src
+                ndp[j] = np.logaddexp(ndp[j], shifted)
+        dp = ndp
+    log_w = dp[0]
+    for s in range(1, model.n_states):
+        log_w = np.logaddexp(log_w, dp[s])
+    total = log_w.max() + math.log(float(np.exp(log_w - log_w.max()).sum()))
+    return np.exp(log_w - total), total
 
 
 def make_series(s1: list[int], s2: list[int], noise_std: float, seed: int = 0):
@@ -207,6 +266,139 @@ class TestModelMechanics(unittest.TestCase):
         elapsed = time.perf_counter() - t0
         self.assertEqual(len(out["posterior_on"][0]), 1440)
         self.assertLess(elapsed, 10.0, f"全天推断耗时 {elapsed:.2f}s 过长")
+
+
+class TestShiftEnergyAudit(unittest.TestCase):
+    """班次用电核算（超额概率）的关键行为自测。"""
+
+    def test_matches_brute_force_enumeration(self):
+        # 小规模情形枚举所有合法联合路径，验证计数 DP 的后验分布逐点一致。
+        d1 = DeviceParams(on_power=6.0, off_power=1.0, min_on=1, min_off=1)
+        d2 = DeviceParams(on_power=4.0, off_power=0.5, min_on=2, min_off=2)
+        s1 = [0, 1, 1, 0, 0, 1]
+        s2 = [1, 1, 0, 0, 1, 1]
+        power = make_series_for(d1, d2, s1, s2, 0.8, seed=11)
+        power[3] = None  # 缺测分钟也参与对照
+        for target_index, target_device in ((0, 1), (1, 2)):
+            exact, exact_ll = brute_force_count_posterior(
+                power, 0.8, d1, d2, target_index
+            )
+            out = shift_energy_audit(
+                power, 0.8, d1, d2, target_device, energy_limit_kwh=0.0
+            )
+            got = np.array(out["on_minutes_posterior"])
+            np.testing.assert_allclose(got, exact, atol=1e-10)
+            self.assertAlmostEqual(out["log_likelihood"], exact_ll, places=9)
+            self.assertAlmostEqual(float(got.sum()), 1.0, places=9)
+
+    def test_log_likelihood_and_mean_match_infer_posterior(self):
+        # 同一模型：对数似然应与 infer_posterior 一致；
+        # 开机分钟数期望应等于逐分钟开机后验概率之和（含缺测分钟）。
+        d1 = DeviceParams(on_power=10.0, off_power=0.5, min_on=4, min_off=4)
+        d2 = DeviceParams(on_power=20.0, off_power=1.0, min_on=3, min_off=3)
+        s1 = [0] * 15 + [1] * 20 + [0] * 15
+        s2 = [1] * 25 + [0] * 25
+        power = make_series_for(d1, d2, s1, s2, 1.0, seed=12)
+        for i in (10, 11, 30, 31, 32):
+            power[i] = None
+        ref = infer_posterior(power, 1.0, d1, d2)
+        for target_device in (1, 2):
+            out = shift_energy_audit(power, 1.0, d1, d2, target_device, 5.0)
+            self.assertAlmostEqual(
+                out["log_likelihood"], ref["log_likelihood"], places=8
+            )
+            expected_on = sum(ref["posterior_on"][target_device - 1])
+            self.assertAlmostEqual(out["expected_on_minutes"], expected_on, places=6)
+            self.assertEqual(out["missing_minutes"], 5)
+
+    def test_exact_limit_is_not_exceeded(self):
+        # 清晰信号下后验集中在真实路径：上限恰好等于真实电量时超额概率≈0，
+        # 上限低一分钟的开机电量时超额概率≈1。
+        d1 = DeviceParams(on_power=6.0, off_power=0.0, min_on=2, min_off=2)
+        d2 = DeviceParams(on_power=8.0, off_power=0.0, min_on=2, min_off=2)
+        s1 = [0] * 10 + [1] * 20 + [0] * 10
+        s2 = [0] * 40
+        power = make_series_for(d1, d2, s1, s2, 0.3, seed=13)
+        exact_energy = 6.0 * 20 / 60.0  # 真实开机 20 分钟的电量
+        out_eq = shift_energy_audit(power, 0.3, d1, d2, 1, exact_energy)
+        self.assertLess(out_eq["exceedance_probability"], 1e-6)
+        out_below = shift_energy_audit(power, 0.3, d1, d2, 1, 6.0 * 19 / 60.0)
+        self.assertGreater(out_below["exceedance_probability"], 1.0 - 1e-6)
+        # 上限取到理论最大电量（全程开机）也不算超额
+        out_max = shift_energy_audit(power, 0.3, d1, d2, 1, 6.0 * 40 / 60.0)
+        self.assertLess(out_max["exceedance_probability"], 1e-6)
+
+    def test_standby_power_counts_toward_energy(self):
+        # 待机功率也计入电量：全程停机也有 0.5*40/60 的底数，
+        # 上限低于该底数时超额概率必须为 1（无论状态路径如何）。
+        d1 = DeviceParams(on_power=6.0, off_power=0.5, min_on=2, min_off=2)
+        d2 = DeviceParams(on_power=8.0, off_power=0.0, min_on=2, min_off=2)
+        s1 = [0] * 40
+        s2 = [0] * 40
+        power = make_series_for(d1, d2, s1, s2, 0.3, seed=14)
+        out = shift_energy_audit(power, 0.3, d1, d2, 1, 0.1)
+        self.assertAlmostEqual(out["exceedance_probability"], 1.0, places=9)
+        self.assertAlmostEqual(out["min_possible_energy_kwh"], 0.5 * 40 / 60.0)
+        self.assertAlmostEqual(out["max_possible_energy_kwh"], 6.0 * 40 / 60.0)
+        # 上限高于理论最大电量时概率为 0
+        out2 = shift_energy_audit(power, 0.3, d1, d2, 1, 10.0)
+        self.assertAlmostEqual(out2["exceedance_probability"], 0.0, places=12)
+
+    def test_missing_minutes_still_counted(self):
+        # 缺测分钟照算：窗口含缺测时，期望开机分钟数仍覆盖整个窗口，
+        # 且电量期望落在理论范围之内。
+        d1 = DeviceParams(on_power=10.0, off_power=0.0, min_on=3, min_off=3)
+        d2 = DeviceParams(on_power=20.0, off_power=0.0, min_on=3, min_off=3)
+        s1 = [1] * 30
+        s2 = [0] * 30
+        power = make_series_for(d1, d2, s1, s2, 0.5, seed=15)
+        for i in range(10, 16):
+            power[i] = None
+        out = shift_energy_audit(power, 0.5, d1, d2, 1, 100.0)
+        self.assertEqual(out["window_minutes"], 30)
+        self.assertEqual(out["missing_minutes"], 6)
+        self.assertGreater(out["expected_on_minutes"], 27.0)  # 缺测不丢分钟
+        self.assertLessEqual(out["expected_energy_kwh"], out["max_possible_energy_kwh"])
+        self.assertGreaterEqual(out["expected_energy_kwh"], out["min_possible_energy_kwh"])
+
+    def test_target_device_selection(self):
+        # 同一窗口下选择不同设备，结果应各自对应其功率口径。
+        d1 = DeviceParams(on_power=10.0, off_power=0.0, min_on=3, min_off=3)
+        d2 = DeviceParams(on_power=20.0, off_power=0.0, min_on=3, min_off=3)
+        s1 = [1] * 20 + [0] * 20
+        s2 = [0] * 40
+        power = make_series_for(d1, d2, s1, s2, 0.5, seed=16)
+        out1 = shift_energy_audit(power, 0.5, d1, d2, 1, 100.0)
+        out2 = shift_energy_audit(power, 0.5, d1, d2, 2, 100.0)
+        self.assertGreater(out1["expected_on_minutes"], 18.0)
+        self.assertLess(out2["expected_on_minutes"], 2.0)
+        self.assertGreater(out1["expected_energy_kwh"], out2["expected_energy_kwh"])
+
+    def test_input_validation(self):
+        d1 = DeviceParams(10.0, 0.0, 3, 3)
+        d2 = DeviceParams(20.0, 0.0, 3, 3)
+        with self.assertRaises(ValueError):
+            shift_energy_audit([], 1.0, d1, d2, 1, 1.0)
+        with self.assertRaises(ValueError):
+            shift_energy_audit([1.0] * 121, 1.0, d1, d2, 1, 1.0)
+        with self.assertRaises(ValueError):
+            shift_energy_audit([1.0] * 10, 1.0, d1, d2, 3, 1.0)
+        with self.assertRaises(ValueError):
+            shift_energy_audit([1.0] * 10, 1.0, d1, d2, 1, -0.5)
+
+    def test_worst_case_runtime(self):
+        # 120 分钟 + 最短时长 30（状态空间最大），验证计数 DP 在合理时间完成。
+        d1 = DeviceParams(10.0, 0.5, 30, 30)
+        d2 = DeviceParams(20.0, 1.0, 30, 30)
+        rng = np.random.default_rng(17)
+        power = [float(rng.normal(15.0, 2.0)) for _ in range(120)]
+        import time
+
+        t0 = time.perf_counter()
+        out = shift_energy_audit(power, 2.0, d1, d2, 1, 30.0)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(len(out["on_minutes_posterior"]), 121)
+        self.assertLess(elapsed, 10.0, f"班次核算耗时 {elapsed:.2f}s 过长")
 
 
 if __name__ == "__main__":
